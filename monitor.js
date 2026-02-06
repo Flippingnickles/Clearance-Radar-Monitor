@@ -3,8 +3,7 @@ const webhook = process.env.DISCORD_WEBHOOK_URL;
 async function run() {
   if (!webhook) throw new Error("DISCORD_WEBHOOK_URL not found");
 
-  // Walmart clearance search (simple test)
-  const url = "https://www.walmart.com/search?q=clearance";
+  const url = "https://www.walmart.com/browse/clearance/0";
 
   const res = await fetch(url, {
     headers: {
@@ -18,35 +17,34 @@ async function run() {
 
   const html = await res.text();
 
-  // VERY basic signal check (Phase 1)
-  const found = html.toLowerCase().includes("clearance");
+  // Basic product extraction (Phase 1)
+  const productMatches = [...html.matchAll(/"name":"(.*?)".*?"price":\{"price":(.*?)\}.*?"canonicalUrl":"(.*?)"/g)];
 
-  if (!found) {
-    console.log("No clearance signal found");
+  if (productMatches.length === 0) {
+    console.log("No clearance products detected");
     return;
   }
 
-  const payload = {
-    content: `🔥 **Walmart Clearance Scan**
-Clearance keyword detected on Walmart search page.
-🔗 ${url}
-⏰ ${new Date().toLocaleString()}`
-  };
+  let message = "🔥 **Walmart Clearance Detected** 🔥\n\n";
 
-  const discordRes = await fetch(webhook, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
+  productMatches.slice(0, 5).forEach(match => {
+    const name = match[1];
+    const price = match[2];
+    const link = "https://www.walmart.com" + match[3];
+
+    message += `• **${name}**\n💲 $${price}\n🔗 ${link}\n\n`;
   });
 
-  if (!discordRes.ok) {
-    throw new Error("Discord webhook failed");
-  }
+  await fetch(webhook, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content: message })
+  });
 
-  console.log("✅ Walmart clearance alert sent");
+  console.log("Walmart clearance alert sent");
 }
 
 run().catch(err => {
-  console.error("❌ Error:", err.message);
+  console.error("❌", err.message);
   process.exit(1);
 });
