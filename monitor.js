@@ -1,23 +1,24 @@
-name: Clearance Radar Monitor
+const webhook = process.env.DISCORD_WEBHOOK_URL;
 
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: "*/30 * * * *"  # runs every 30 minutes
+async function run() {
+  if (!webhook) throw new Error("DISCORD_WEBHOOK_URL not found");
 
-jobs:
-  run-monitor:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+  // Phase 2: Walmart online "clearance" scraper (simple + lightweight)
+  const url = "https://www.walmart.com/search?q=clearance";
 
-    steps:
-      - uses: actions/checkout@v4
+  const res = await fetch(url, {
+    headers: {
+      // Basic UA helps avoid some bot blocks
+      "User-Agent": "Mozilla/5.0 (GitHub Actions) ClearanceRadar/1.0"
+    }
+  });
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 18
+  if (!res.ok) {
+    throw new Error(`Walmart fetch failed: ${res.status}`);
+  }
 
-      - name: Run monitor
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: node monitor.js
+  const html = await res.text();
+
+  // Look for product JSON-ish patterns on the page
+  // We keep it simple: pull a handful of name/price/url matches if present.
+  const regex = /"name":"([^"]+)".*?"price":\{"price":([0-9.]+).*?"
