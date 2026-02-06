@@ -2,6 +2,8 @@ name: Clearance Radar Monitor
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
 
 jobs:
   run-monitor:
