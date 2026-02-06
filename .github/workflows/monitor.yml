@@ -3,11 +3,13 @@ name: Clearance Radar Monitor
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/30 * * * *" # every 30 minutes
 
 jobs:
   run-monitor:
     runs-on: ubuntu-latest
+    timeout-minutes: 3
+
     steps:
       - uses: actions/checkout@v4
 
@@ -15,6 +17,7 @@ jobs:
         with:
           node-version: 18
 
-      - run: node monitor.js
+      - name: Run monitor
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: node monitor.js
