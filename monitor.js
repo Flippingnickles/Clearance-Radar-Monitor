@@ -1,182 +1,245 @@
 /**
- * Clearance Radar Monitor
- * Sources:
- * - Walmart (existing)
- * - Kohl's (added)
+ * Clearance Radar Monitor (Walmart + Kohl's)
+ * Option A: Kohl's Clearance-only
  *
- * Behavior:
- * - Runs every 30 minutes via GitHub Actions
- * - Sends Discord message for each source (heartbeat if none found)
- * - Hard timeouts to prevent hanging runs
+ * Runs in GitHub Actions on a schedule and posts results to Discord via webhook.
+ * Goal: Run fast, never hang, and always send a useful Discord message each run.
  */
 
 const webhook = process.env.DISCORD_WEBHOOK_URL;
 
-if (!webhook) {
-  console.error("❌ DISCORD_WEBHOOK_URL not set");
-  process.exit(1);
+const MAX_ITEMS_PER_STORE = 5;
+const TIMEOUT_MS = 20000; // hard timeout per fetch to avoid hangs
+
+function withTimeoutFetch(url, options = {}, timeoutMs = TIMEOUT_MS) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, { ...options, signal: controller.signal })
+    .finally(() => clearTimeout(id));
+}
+
+function safeText(s) {
+  if (!s) return "";
+  return String(s).replace(/\s+/g, " ").trim();
+}
+
+function formatMoney(val) {
+  if (val == null) return "";
+  const n = Number(val);
+  if (Number.isFinite(n)) return `$${n.toFixed(2)}`;
+  return String(val);
+}
+
+function truncateForDiscord(text, limit = 1900) {
+  if (text.length <= limit) return text;
+  return text.slice(0, limit - 10) + "\n…(trimmed)";
 }
 
 async function postToDiscord(content) {
-  const res = await fetch(webhook, {
+  const res = await withTimeoutFetch(webhook, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content }),
-  });
+    body: JSON.stringify({ content })
+  }, 15000);
 
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Discord webhook failed: ${res.status} ${text}`);
+    const txt = await res.text().catch(() => "");
+    throw new Error(`Discord webhook failed: ${res.status} ${safeText(txt)}`);
   }
 }
 
-async function fetchHtml(url, timeoutMs = 20000) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+/**
+ * WALMART (simple “clearance” search scrape)
+ * NOTE: Walmart HTML is dynamic; this tries multiple JSON-ish patterns.
+ */
+async function fetchWalmartClearance() {
+  const url = "https://www.walmart.com/search?q=clearance&sort=price_low";
 
-  try {
-    const res = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (GitHub Actions) ClearanceRadar/1.0",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-    });
+  const res = await withTimeoutFetch(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (GitHub Actions) ClearanceRadar/1.0",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+  });
 
-    const text = await res.text();
-    return { ok: res.ok, status: res.status, text };
-  } catch (e) {
-    return { ok: false, status: "timeout_or_block", text: String(e?.message || e) };
-  } finally {
-    clearTimeout(timeout);
-  }
-}
+  if (!res.ok) throw new Error(`Walmart fetch failed: ${res.status}`);
+  const html = await res.text();
 
-// -------------------------
-// WALMART
-// -------------------------
-function parseWalmart(html) {
-  const regex =
-    /"name":"([^"]+?)".*?"price":\{"price":([0-9.]+).*?"canonicalUrl":"([^"]+?)"/g;
-
-  const matches = [...html.matchAll(regex)];
+  // Pattern tries:
+  // - name/title fields
+  // - price fields
+  // - canonicalUrl or productPageUrl
   const items = [];
 
-  for (const m of matches.slice(0, 6)) {
-    const name = m[1];
-    const price = Number(m[2]);
-    const path = m[3];
-    const link = path.startsWith("http") ? path : `https://www.walmart.com${path}`;
-
-    if (!name || !Number.isFinite(price) || !link) continue;
-    items.push({ name, price, link });
+  // Try canonicalUrl pattern
+  const rx1 = /"name":"([^"]+?)".{0,400}?"price":\{"price":([0-9.]+).{0,400}?"canonicalUrl":"([^"]+?)"/g;
+  let m;
+  while ((m = rx1.exec(html)) !== null && items.length < 30) {
+    const name = safeText(m[1]);
+    const price = formatMoney(m[2]);
+    const path = m[3].startsWith("http") ? m[3] : `https://www.walmart.com${m[3]}`;
+    if (name && price && path) items.push({ name, price, link: path });
   }
 
-  return items;
-}
-
-// -------------------------
-// KOHLS
-// -------------------------
-// We will monitor Kohl's clearance page and try to extract item links + prices.
-// Kohl's markup changes, so we parse conservatively and fall back to heartbeat.
-function parseKohls(html) {
-  const items = [];
-
-  // Try to grab "productTitle" and price patterns that appear in embedded JSON or HTML.
-  // Example patterns we attempt:
-  // "productTitle":"...","salePrice":"..."
-  // or "productTitle":"...","price":"..."
-  const reA = /"productTitle":"([^"]{3,160})".{0,500}?"salePrice":"?\$?([0-9.]+)"?/g;
-  const reB = /"productTitle":"([^"]{3,160})".{0,500}?"price":"?\$?([0-9.]+)"?/g;
-  const reUrl = /"pdpUrl":"([^"]{5,220})"/g;
-
-  const titlesA = [...html.matchAll(reA)];
-  const titlesB = [...html.matchAll(reB)];
-  const urls = [...html.matchAll(reUrl)].map((m) => m[1]);
-
-  const candidates = titlesA.length ? titlesA : titlesB;
-
-  for (let i = 0; i < Math.min(6, candidates.length); i++) {
-    const title = candidates[i][1]
-      .replace(/\\u002F/g, "/")
-      .replace(/\s+/g, " ")
-      .trim();
-    const priceNum = Number(candidates[i][2]);
-
-    const rawUrl = urls[i] || "";
-    let link = rawUrl.replace(/\\u002F/g, "/");
-    if (link && !link.startsWith("http")) link = `https://www.kohls.com${link}`;
-
-    if (!title || !Number.isFinite(priceNum)) continue;
-
-    items.push({
-      name: title,
-      price: priceNum,
-      link: link || "https://www.kohls.com/sale-event/clearance.jsp",
-    });
+  // Fallback: productPageUrl
+  const rx2 = /"name":"([^"]+?)".{0,600}?"price":\{"price":([0-9.]+).{0,600}?"productPageUrl":"([^"]+?)"/g;
+  while ((m = rx2.exec(html)) !== null && items.length < 30) {
+    const name = safeText(m[1]);
+    const price = formatMoney(m[2]);
+    const path = m[3].startsWith("http") ? m[3] : `https://www.walmart.com${m[3]}`;
+    if (name && price && path) items.push({ name, price, link: path });
   }
 
-  return items;
-}
-
-async function runSource({ label, url, parser }) {
-  const { ok, status, text } = await fetchHtml(url, 20000);
-
-  if (!ok) {
-    await postToDiscord(
-      `🟠 **${label} Radar Ran**\nFetch issue: **${status}**\nLink: ${url}`
-    );
-    return;
-  }
-
-  const items = parser(text);
-
-  if (!items.length) {
-    await postToDiscord(
-      `🟢 **${label} Radar Ran Successfully**\nNo clearance items found this run.\nLink: ${url}`
-    );
-    return;
-  }
-
-  let msg = `🔥 **${label} Clearance Detected** 🔥\n\n`;
+  // De-dupe by link
+  const seen = new Set();
+  const deduped = [];
   for (const it of items) {
-    msg += `• **$${it.price.toFixed(2)}** — ${it.name}\n${it.link}\n\n`;
+    if (!it.link || seen.has(it.link)) continue;
+    seen.add(it.link);
+    deduped.push(it);
+    if (deduped.length >= MAX_ITEMS_PER_STORE) break;
   }
 
-  await postToDiscord(msg.trim());
+  return deduped;
+}
+
+/**
+ * KOHL'S (Clearance-only catalog page scrape)
+ * Kohl's is also dynamic; we parse embedded JSON-ish blobs when present.
+ */
+async function fetchKohlsClearance() {
+  // Clearance catalog page
+  const url = "https://www.kohls.com/catalog/clearance.jsp?CN=Promotions:Clearance";
+
+  const res = await withTimeoutFetch(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (GitHub Actions) ClearanceRadar/1.0",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+  });
+
+  if (!res.ok) throw new Error(`Kohl's fetch failed: ${res.status}`);
+  const html = await res.text();
+
+  const items = [];
+
+  // Common-ish fields found in various Kohl's page payloads:
+  // "productTitle" / "title"
+  // "salePrice" / "regularPrice" / "price"
+  // "productSeoUrl" / "seoUrl" / "/product/..."
+  //
+  // Try to catch a URL + title + price near each other
+  const rx = /"productTitle":"([^"]+?)".{0,800}?"productSeoUrl":"([^"]+?)".{0,800}?(?:"salePrice":\{"minPrice":([0-9.]+)|"salePrice":([0-9.]+)|"price":([0-9.]+))/g;
+
+  let m;
+  while ((m = rx.exec(html)) !== null && items.length < 30) {
+    const name = safeText(m[1]);
+    const seo = m[2];
+    const rawPrice = m[3] || m[4] || m[5];
+    const price = formatMoney(rawPrice);
+
+    let link = "";
+    if (seo) {
+      link = seo.startsWith("http") ? seo : `https://www.kohls.com${seo.startsWith("/") ? "" : "/"}${seo}`;
+    }
+
+    if (name && price && link) items.push({ name, price, link });
+  }
+
+  // Fallback pattern: sometimes "seoUrl" appears
+  const rx2 = /"productTitle":"([^"]+?)".{0,800}?"seoUrl":"([^"]+?)".{0,800}?(?:"salePrice":\{"minPrice":([0-9.]+)|"salePrice":([0-9.]+)|"price":([0-9.]+))/g;
+  while ((m = rx2.exec(html)) !== null && items.length < 30) {
+    const name = safeText(m[1]);
+    const seo = m[2];
+    const rawPrice = m[3] || m[4] || m[5];
+    const price = formatMoney(rawPrice);
+
+    let link = "";
+    if (seo) {
+      link = seo.startsWith("http") ? seo : `https://www.kohls.com${seo.startsWith("/") ? "" : "/"}${seo}`;
+    }
+
+    if (name && price && link) items.push({ name, price, link });
+  }
+
+  // De-dupe by link
+  const seen = new Set();
+  const deduped = [];
+  for (const it of items) {
+    if (!it.link || seen.has(it.link)) continue;
+    seen.add(it.link);
+    deduped.push(it);
+    if (deduped.length >= MAX_ITEMS_PER_STORE) break;
+  }
+
+  return deduped;
+}
+
+function buildMessage({ walmart, kohls }) {
+  const now = new Date().toLocaleString("en-US", { timeZone: "America/Chicago" });
+
+  let message = `🟢 **Clearance Radar Ran Successfully**\n`;
+  message += `Run time: ${now}\n\n`;
+
+  const anyFound = (walmart?.length || 0) + (kohls?.length || 0) > 0;
+
+  if (!anyFound) {
+    message += `No clearance items found this run.`;
+    return message;
+  }
+
+  if (walmart?.length) {
+    message += `🛒 **Walmart (Clearance Search)**\n`;
+    for (const it of walmart) {
+      message += `• **${it.name}** — ${it.price}\n${it.link}\n`;
+    }
+    message += `\n`;
+  } else {
+    message += `🛒 **Walmart**\n• No items found.\n\n`;
+  }
+
+  if (kohls?.length) {
+    message += `🏷️ **Kohl's (Clearance)**\n`;
+    for (const it of kohls) {
+      message += `• **${it.name}** — ${it.price}\n${it.link}\n`;
+    }
+    message += `\n`;
+  } else {
+    message += `🏷️ **Kohl's**\n• No items found.\n\n`;
+  }
+
+  return truncateForDiscord(message);
 }
 
 async function run() {
-  // Hard exit so nothing hangs
-  const hard = setTimeout(() => {
-    console.error("❌ Hard timeout hit — exiting.");
-    process.exit(1);
-  }, 60000);
+  if (!webhook) throw new Error("DISCORD_WEBHOOK_URL not found");
+
+  // Fetch both stores (sequential to keep it simple + reliable)
+  let walmart = [];
+  let kohls = [];
 
   try {
-    await runSource({
-      label: "Walmart",
-      url: "https://www.walmart.com/search?q=clearance&sort=price_low",
-      parser: parseWalmart,
-    });
-
-    await runSource({
-      label: "Kohl's",
-      url: "https://www.kohls.com/sale-event/clearance.jsp",
-      parser: parseKohls,
-    });
-  } finally {
-    clearTimeout(hard);
+    walmart = await fetchWalmartClearance();
+  } catch (e) {
+    // Still send a message even if one store fails
+    walmart = [];
+    console.error("Walmart error:", e?.message || e);
   }
 
-  process.exit(0);
+  try {
+    kohls = await fetchKohlsClearance();
+  } catch (e) {
+    kohls = [];
+    console.error("Kohl's error:", e?.message || e);
+  }
+
+  const msg = buildMessage({ walmart, kohls });
+  await postToDiscord(msg);
+
+  console.log("✅ Clearance Radar alert sent");
 }
 
-run().catch(async (err) => {
+run().catch((err) => {
   console.error("❌", err?.message || err);
-  try {
-    await postToDiscord(`🔴 **Clearance Radar Error**\n\`${String(err?.message || err)}\``);
-  } catch {}
   process.exit(1);
 });
