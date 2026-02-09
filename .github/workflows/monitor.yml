@@ -1,161 +1,24 @@
-// monitor.js
-// Clearance Radar Monitor — Walmart + Kohl's (simple + lightweight)
-// Sends a Discord message EVERY run so you know it’s alive.
-// If items are detected, it posts top matches with links.
+name: Clearance Radar Monitor
 
-const webhook = process.env.DISCORD_WEBHOOK_URL;
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
 
-const WALMART_URL = "https://www.walmart.com/search?q=clearance&sort=price_low";
-const KOHLS_URL = "https://www.kohls.com/catalog/clearance.jsp?CN=Promotions:Clearance";
+jobs:
+  run-monitor:
+    runs-on: ubuntu-latest
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-async function postToDiscord(content) {
-  const res = await fetch(webhook, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content }),
-  });
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Discord webhook failed: ${res.status} ${text}`);
-  }
-}
-
-function dedupeByLink(items) {
-  const seen = new Set();
-  const out = [];
-  for (const it of items) {
-    const key = it.link || it.name;
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    out.push(it);
-  }
-  return out;
-}
-
-// ---- Walmart scraper (same approach you already had) ----
-function parseWalmart(html) {
-  // Pull some product-like JSON fragments
-  // This is not perfect; it’s lightweight and may miss items sometimes.
-  const regex =
-    /"name":"([^"]+)".*?"price":\{"price":([0-9.]+).*?"canonicalUrl":"([^"]+)"/g;
-
-  const matches = [...html.matchAll(regex)];
-  const items = matches.slice(0, 8).map((m) => ({
-    store: "Walmart",
-    name: m[1],
-    price: m[2],
-    link: `https://www.walmart.com${m[3]}`,
-  }));
-  return items;
-}
-
-// ---- Kohl’s scraper (lightweight HTML pattern matching) ----
-function parseKohls(html) {
-  // Kohl's pages often contain JSON-ish fragments with product URLs and names.
-  // We'll try a few patterns to grab something useful without heavy dependencies.
-
-  const items = [];
-
-  // Pattern 1: productUrl + productTitle
-  const r1 = /"productUrl":"([^"]+)".*?"productTitle":"([^"]+)"/g;
-  for (const m of html.matchAll(r1)) {
-    const rawUrl = m[1].replace(/\\u002F/g, "/");
-    const title = m[2].replace(/\\u0026/g, "&");
-    const link = rawUrl.startsWith("http")
-      ? rawUrl
-      : `https://www.kohls.com${rawUrl.startsWith("/") ? "" : "/"}${rawUrl}`;
-
-    items.push({
-      store: "Kohl's",
-      name: title,
-      price: "", // Not always easy to extract reliably in lightweight mode
-      link,
-    });
-    if (items.length >= 8) break;
-  }
-
-  // Pattern 2: fallback for "pdpUrl" + "title"
-  if (items.length === 0) {
-    const r2 = /"pdpUrl":"([^"]+)".*?"title":"([^"]+)"/g;
-    for (const m of html.matchAll(r2)) {
-      const rawUrl = m[1].replace(/\\u002F/g, "/");
-      const title = m[2].replace(/\\u0026/g, "&");
-      const link = rawUrl.startsWith("http")
-        ? rawUrl
-        : `https://www.kohls.com${rawUrl.startsWith("/") ? "" : "/"}${rawUrl}`;
-
-      items.push({
-        store: "Kohl's",
-        name: title,
-        price: "",
-        link,
-      });
-      if (items.length >= 8) break;
-    }
-  }
-
-  return items;
-}
-
-async function fetchHtml(url) {
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (GitHub Actions) ClearanceRadar/2.0",
-      "Accept-Language": "en-US,en;q=0.9",
-    },
-  });
-
-  if (!res.ok) throw new Error(`Fetch failed ${res.status} for ${url}`);
-  return await res.text();
-}
-
-async function run() {
-  if (!webhook) throw new Error("DISCORD_WEBHOOK_URL not found (GitHub secret missing)");
-
-  const started = new Date().toLocaleString("en-US", { timeZone: "America/Chicago" });
-
-  // Always send a heartbeat first so you KNOW it ran
-  await postToDiscord(`🟢 **Clearance Radar Ran** (${started})\nChecking: Walmart + Kohl's...`);
-
-  // Fetch both stores
-  const [wHtml, kHtml] = await Promise.all([
-    fetchHtml(WALMART_URL),
-    (async () => {
-      // small delay to reduce chance of both requests looking "botty"
-      await sleep(1200);
-      return fetchHtml(KOHLS_URL);
-    })(),
-  ]);
-
-  let items = [];
-  items = items.concat(parseWalmart(wHtml));
-  items = items.concat(parseKohls(kHtml));
-  items = dedupeByLink(items);
-
-  if (items.length === 0) {
-    await postToDiscord("⚪ **No items found** this run (Walmart + Kohl's).");
-    return;
-  }
-
-  // Build message
-  let msg = "🔥 **Deals Found (Walmart + Kohl's)** 🔥\n";
-  for (const it of items.slice(0, 10)) {
-    const pricePart = it.price ? ` — **$${it.price}**` : "";
-    msg += `• **${it.store}**: ${it.name}${pricePart}\n${it.link}\n\n`;
-  }
-
-  await postToDiscord(msg);
-}
-
-run().catch(async (err) => {
-  console.error("❌", err.message);
-  try {
-    await postToDiscord(`🔴 **Clearance Radar Error**\n\`${err.message}\``);
-  } catch (_) {}
-  process.exit(1);
-});
+      - name: Run Clearance Monitor
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: node monitor.js
